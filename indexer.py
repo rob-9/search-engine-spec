@@ -16,8 +16,8 @@ from bs4 import BeautifulSoup
 from nltk.stem import PorterStemmer
 
 # configuration
-CORPUS_ZIP = "/Users/robert/Downloads/developer.zip"
-INDEX_DIR = Path("/Users/robert/a3/index")
+CORPUS_ZIP = "developer.zip"
+INDEX_DIR = Path("index")
 BATCH_SIZE = 18_000  # docs per partial index (ensures >= 3 offloads for ~55k docs)
 
 IMPORTANT_TAGS = {"title", "h1", "h2", "h3", "b", "strong"}

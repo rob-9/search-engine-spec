@@ -65,30 +65,78 @@ IDF × (tf × (k1 + 1)) / (tf + k1 × (1 - b + b × dl/avgdl))
 
 **AND/OR fallback** (`search.py:280`): if boolean AND yields < 5 results, fall back to OR union. Documents matching all terms get a 1.5× AND bonus.
 
-## M3 Improvements
+### All scoring weights (`search.py:19-40`)
 
-### Core changes from M2 → M3
+| Constant | Value | Purpose |
+|---|---|---|
+| `BM25_K1` | 1.2 | tf saturation — higher = more credit for repeated terms |
+| `BM25_B` | 0.75 | length normalization — 0 = ignore doc length, 1 = full normalization |
+| `TIER_MULTIPLIERS[3]` | 3.0× | title match boost |
+| `TIER_MULTIPLIERS[2]` | 2.0× | h1 match boost |
+| `TIER_MULTIPLIERS[1]` | 1.5× | h2/h3/b/strong match boost |
+| `TIER_MULTIPLIERS[0]` | 1.0× | body text (no boost) |
+| `AND_BONUS` | 1.5× | multiplier for docs matching all terms in OR fallback mode |
+| `AND_MIN_RESULTS` | 5 | AND result count threshold before falling back to OR |
+| `PAGERANK_WEIGHT` | 500.0 | scalar for raw PageRank values (~0.00002 per doc) |
+| `PROXIMITY_WEIGHT` | 2.0 | numerator in proximity bonus: `2.0 / (1 + span)` |
+| `CACHE_MAX` | 1000 | LRU postings cache size (not a scoring weight) |
+
+**How weights were determined:**
+- `BM25_K1=1.2`, `BM25_B=0.75` — standard values from the BM25 literature (Robertson et al.), used by most search engines as sensible defaults.
+- `TIER_MULTIPLIERS` — set by descending HTML semantic importance. Title is the strongest signal of page topic (3×), h1 is a section-level signal (2×), emphasis tags are moderate (1.5×), body is baseline (1×). Validated by checking that queries like "dean" and "cristina lopes" surface the correct authoritative page.
+- `PAGERANK_WEIGHT=500.0` — raw PageRank values are very small (~0.00002 per doc). 500× scales them to contribute ~0.5–3 points, making PageRank a meaningful tiebreaker without overpowering content relevance (BM25 typically scores 6–10+).
+- `PROXIMITY_WEIGHT=2.0` — gives up to 2 points for co-located terms (adjacent → 1.0, same position → 2.0). Tuned so phrase-like queries ("information retrieval", "capstone project") rank exact-phrase pages higher without dominating the score.
+- `AND_BONUS=1.5×` — in OR fallback mode, docs matching all terms should clearly outrank partial matches. 1.5× was chosen empirically: high enough to separate full matches from partial, low enough that a strong partial match with high PageRank can still compete.
+- `AND_MIN_RESULTS=5` — threshold for OR fallback. Set low enough that multi-word queries like "master of software engineering" (which return 0–2 AND results) trigger fallback, but high enough that common two-word queries stay in AND mode.
+
+## Test Queries (`queries.txt`)
+
+We tested with 22 queries (10 GOOD, 12 FIXED), following the assignment requirement that at least half should start with poor relevance or speed, then be improved by general code changes while preserving the other half's good performance.
+
+### GOOD queries (10) — relevant results, fast response
+
+These queries worked well from the start due to strong corpus coverage and natural BM25 behavior. They serve as a regression baseline: every M3 change was validated against these to ensure no degradation.
+
+| Query | Why it works well |
+|---|---|
+| machine learning | Common CS topic, many relevant pages, bigram boost helps |
+| cristina lopes | Faculty name, title/h1 tier boost surfaces profile page |
+| informatics | Department name, strong tf-idf signal |
+| software engineering | Degree program, bigram `softwar_engin` boosts exact phrase |
+| ACM | Well-known acronym with clear matches |
+| computer science | Broad department topic, good coverage |
+| artificial intelligence | Research area, cross-page coverage |
+| data structures | Course topic, bigram helps exact phrase |
+| python programming | Popular language, many course pages |
+| algorithm | Fundamental CS concept, high recall |
+
+### FIXED queries (12) — previously poor, improved by M3 changes
+
+Each query below performed poorly on relevance and/or speed before M3. The table shows the specific problem, which general-purpose fix addressed it, and how the fix works. All fixes are general heuristics — none are query-specific.
+
+| Query | Problem (M2) | Fix (M3) | How the fix is general |
+|---|---|---|---|
+| master of software engineering | AND over 4 terms → 0 results | OR fallback with AND bonus | Applies to any multi-term query where AND is too strict |
+| undergraduate research opportunities in machine learning | AND over 7 terms → 0 results | OR fallback with AND bonus | Same OR fallback, scales to any query length |
+| ICS | Short acronym biased toward long docs | BM25 length normalization (b=0.75) | Normalizes all queries, not just short ones |
+| information retrieval | No phrase awareness, scattered matches ranked high | Bigram indexing (`inform_retriev`) | All consecutive term pairs get bigrams automatically |
+| dean | Body-only matches outranked actual dean's page | Tiered importance (title 3×, h1 2×) | Applies to all terms in any important HTML tag |
+| fellowship | Near-identical pages cluttered top results | SimHash dedup (Hamming ≤ 3) | Filters all near-duplicates corpus-wide |
+| graduate admission | Long FAQ pages outranked short authoritative pages | BM25 length normalization | Same b=0.75 normalization as the ICS fix |
+| capstone project | No adjacency signal for phrase | Bigram boost | Same bigram mechanism as information retrieval |
+| Rina Dechter | Name not prominent in her own page body | Anchor text indexing (tier 2) | All anchor text from all links indexed automatically |
+| database management | Generic long pages ranked first | Tiered importance + BM25 | Same tier multipliers + length normalization |
+| web crawler | AND returned few results | OR fallback | Same fallback mechanism |
+| uci computer science ranking | 5-term AND too restrictive → 0 results | OR fallback + AND bonus | Same fallback mechanism |
+
+### Core M3 changes (general-purpose, not query-specific)
 
 | M2 Problem | M3 Fix | Code |
 |---|---|---|
-| Raw tf-idf biased toward long documents | BM25 with length normalization (k1=1.2, b=0.75) | `search.py:289` |
-| No distinction between title match and body match | Tiered importance: title 3×, h1 2×, emphasis 1.5× | `search.py:24-29`, `indexer.py:36-48` |
-| Boolean AND too strict for multi-word queries | OR fallback when AND < 5 results, 1.5× AND bonus | `search.py:280,305-314` |
-| Repeated disk seeks for same terms | LRU postings cache (1000 entries) | `search.py:126-145` |
-
-### Problems found via test queries and how they were fixed
-
-| Query example | Problem | Fix |
-|---|---|---|
-| "master of software engineering" | AND over 4+ terms returned 0 results | OR fallback finds partial matches |
-| "ICS" | Short acronym biased toward longest docs | BM25 normalizes by doc length |
-| "information retrieval" | No phrase awareness, scattered matches ranked high | Bigram `inform_retriev` boosts exact phrase |
-| "dean" | Body-only matches outranked the actual dean's page | Title/h1 tier boost surfaces authoritative page |
-| "fellowship" | Near-identical pages cluttered results | SimHash dedup filters copies |
-| "graduate admission" | Long FAQ pages outranked short focused pages | BM25 length normalization |
-| "Rina Dechter" | Only found if exact AND match in body text | Anchor text from linking pages adds signal |
-| "capstone project" | No adjacency signal | Bigram boost for consecutive terms |
-| "uci computer science ranking" | 5-term AND too restrictive, 0 results | OR fallback + AND bonus for best matches |
+| Raw tf-idf biased toward long documents | BM25 with length normalization (k1=1.2, b=0.75) | `search.py:302` |
+| No distinction between title match and body match | Tiered importance: title 3×, h1 2×, emphasis 1.5× | `search.py:24-29`, `indexer.py:41-48` |
+| Boolean AND too strict for multi-word queries | OR fallback when AND < 5 results, 1.5× AND bonus | `search.py:292, 318-340` |
+| Repeated disk seeks for same terms | LRU postings cache (1000 entries) | `search.py:135-154` |
 
 ### Operational constraints (developer option)
 
@@ -156,7 +204,9 @@ python web.py
 
 ## Performance
 
-- Index stays on disk (~500+ MB); only metadata loaded into memory
+- Index stays on disk (~800 MB); only metadata loaded into memory
 - Partial index offloading every 18k docs keeps memory bounded during indexing
 - LRU postings cache (1000 entries) speeds up repeated/similar queries
-- Typical query response: < 100ms
+- Lazy position parsing: position data in postings is kept as raw strings and only parsed when proximity scoring needs it, avoiding hundreds of thousands of unnecessary `int()` conversions per query
+- OR fallback filters low-IDF terms from candidate expansion and prioritizes docs matching 2+ terms, keeping the candidate set small without sacrificing ranking quality
+- Typical query response: < 100ms (worst case < 300ms)

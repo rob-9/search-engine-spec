@@ -1,0 +1,117 @@
+# Query Test Log — 100 queries
+# Index: 55393 docs, 6556291 terms, 17937 duplicates
+# Date: 2026-03-13
+
+Query                                                         Results  Time (ms)
+--------------------------------------------------------------------------------
+cristina lopes                                                     57        6.6
+machine learning                                                  451      164.5
+ACM                                                               474       13.3
+master of software engineering                                    357      150.3
+informatics                                                       358       18.6
+software engineering                                              405       67.2
+artificial intelligence                                           634       17.2
+data structures                                                   784       84.1
+python programming                                                341       30.5
+algorithm                                                         875       15.8
+information retrieval                                             408       38.3
+Rina Dechter                                                      476        8.4
+fellowship                                                        563        7.5
+ICS                                                               506       66.6
+dean                                                              611       15.8
+graduate admission                                                698       31.9
+capstone project                                                  125       27.9
+database management                                                85      105.8
+web crawler                                                        24       37.0
+uci computer science ranking                                      281      144.0
+undergraduate research opportunities in machine learning          135      135.6
+computer science                                                  618      159.3
+cloud computing                                                   195       28.3
+cybersecurity                                                     120        1.2
+natural language processing                                       296       25.1
+deep learning neural networks                                     122       18.7
+human computer interaction                                        361       74.0
+operating systems                                                 349       80.0
+compiler design                                                   421       28.3
+blockchain                                                         20        0.6
+network security                                                  554       27.9
+data mining                                                       539       20.8
+software testing                                                  439       74.8
+parallel computing                                                599       25.0
+virtual reality                                                   172        5.9
+internet of things                                                553       56.6
+robotics                                                          389        2.6
+bioinformatics                                                    327        2.8
+game design                                                       464       56.9
+computer vision                                                   765      207.2
+reinforcement learning                                             75        9.3
+graph theory                                                      757       27.3
+encryption                                                        175        2.9
+distributed systems                                               718       46.9
+mobile computing                                                  691       32.4
+user experience design                                            448       49.2
+computational biology                                             530       26.4
+information security                                              627       49.5
+web development                                                   350       63.4
+computer architecture                                             676       35.8
+embedded systems                                                  463       23.8
+formal methods                                                    246       11.7
+knowledge representation                                          289       12.0
+semantic web                                                      259       30.7
+recommendation systems                                            226       44.5
+text mining                                                       163       13.0
+image processing                                                  602       34.1
+social computing                                                  600       80.9
+health informatics                                                340       10.5
+genetic algorithm                                                 167        8.6
+computer graphics                                                 775       25.5
+simulation                                                        752        9.2
+optimization                                                      787       18.0
+pattern recognition                                               320       12.9
+cognitive science                                                 313       11.3
+digital signal processing                                          82        8.8
+multiagent systems                                                 11        2.8
+privacy                                                           494       18.5
+usability                                                         262        2.4
+crowdsourcing                                                     118        0.9
+sensor networks                                                   317        8.3
+programming languages                                             425       48.8
+logic programming                                                 335       17.9
+database systems                                                  161       84.8
+file systems                                                      225      133.2
+search engine                                                     507       61.2
+clustering                                                        697       13.6
+classification                                                    747        5.1
+regression                                                        381        2.6
+sentiment analysis                                                 27        4.5
+topic modeling                                                    334       35.4
+transfer learning                                                 209       11.2
+edge computing                                                    703       26.2
+quantum computing                                                  79        7.3
+augmented reality                                                  99        3.4
+smart home                                                        246       12.5
+wearable computing                                                125       10.1
+assistive technology                                              429       30.0
+computer ethics                                                   164        8.2
+open source                                                       824      220.4
+version control                                                   573       38.4
+agile development                                                  43        8.1
+code review                                                       358       32.6
+continuous integration                                            518       24.4
+unit testing                                                      362       27.9
+debugging                                                         546       12.9
+memory management                                                 284       39.4
+cache                                                             449       12.5
+thread synchronization                                             39        4.2
+load balancing                                                    194       15.1
+
+================================================================================
+Total queries:      100
+Avg response time:  37.7ms
+Max response time:  220.4ms
+Min response time:  0.6ms
+Median:             25.0ms
+Under 100ms:        91/100
+Under 300ms:        100/100
+Over 300ms:         0/100
+Zero results:       0/100

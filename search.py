@@ -1,7 +1,7 @@
 """
 search engine retrieval — assignment 3 m3
 BM25 ranking with tiered importance, OR fallback, dedup filtering,
-URL quality signal, and LRU postings cache.
+bigram boost, URL quality signal, and LRU postings cache.
 """
 
 import math
@@ -168,7 +168,7 @@ def search(query: str, ioi: dict[str, int], doc_map: dict[int, str],
            avgdl: float, duplicates: dict[int, int],
            cache: PostingsCache,
            url_to_did: dict[str, int] | None = None) -> list[tuple[str, float]]:
-    """BM25 search with AND→OR fallback, tiered importance, dedup."""
+    """BM25 search with AND→OR fallback, tiered importance, bigram boost, dedup."""
     tokens = tokenize(query)
     if not tokens:
         return []
@@ -193,6 +193,21 @@ def search(query: str, ioi: dict[str, int], doc_map: dict[int, str],
         idf = math.log((total_docs - df + 0.5) / (df + 0.5) + 1)
         term_idfs.append(idf)
 
+    # bigram boost: if query has 2+ terms, look up bigrams
+    bigram_docs: dict[int, float] = {}
+    stemmed_query = [cached_stem(t) for t in tokens]
+    for i in range(len(stemmed_query) - 1):
+        bg = f"{stemmed_query[i]}_{stemmed_query[i+1]}"
+        bg_postings = fetch_postings(bg, ioi, index_fh, cache)
+        if bg_postings:
+            bg_df = len(bg_postings)
+            bg_idf = math.log((total_docs - bg_df + 0.5) / (bg_df + 0.5) + 1)
+            for doc_id, tf, tier in bg_postings:
+                dl = doc_lengths.get(doc_id, avgdl)
+                bm25 = bg_idf * (tf * (BM25_K1 + 1)) / (tf + BM25_K1 * (1 - BM25_B + BM25_B * dl / avgdl))
+                mult = TIER_MULTIPLIERS.get(tier, 1.0)
+                bigram_docs[doc_id] = bigram_docs.get(doc_id, 0.0) + bm25 * mult
+
     # AND intersection
     non_empty = [tp for tp in term_postings if tp]
     if len(non_empty) == len(stems) and len(stems) > 0:
@@ -214,6 +229,7 @@ def search(query: str, ioi: dict[str, int], doc_map: dict[int, str],
             dl = doc_lengths.get(doc_id, avgdl)
             bm25 = term_idfs[i] * (tf * (BM25_K1 + 1)) / (tf + BM25_K1 * (1 - BM25_B + BM25_B * dl / avgdl))
             score += bm25 * TIER_MULTIPLIERS.get(tier, 1.0)
+        score += bigram_docs.get(doc_id, 0.0)
         url = doc_map.get(doc_id, "")
         score += url_quality_score(url)
         return score

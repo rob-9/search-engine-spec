@@ -4,6 +4,7 @@ reads from developer.zip, builds a disk-based inverted index with:
   - tiered importance scoring (0-3)
   - document length tracking for BM25
   - SimHash near-duplicate detection
+  - bigram indexing
 """
 
 import json
@@ -85,7 +86,7 @@ def hamming_distance(a: int, b: int) -> int:
 
 
 def parse_document(html: str):
-    """returns (term_tf, stem_max_tier, doc_length)."""
+    """returns (term_tf, stem_max_tier, doc_length, stemmed_tokens)."""
     soup = BeautifulSoup(html, "lxml")
 
     # tiered importance: track max tier per stem
@@ -98,15 +99,16 @@ def parse_document(html: str):
                 if tier > stem_max_tier.get(s, -1):
                     stem_max_tier[s] = tier
 
-    # full text tf + doc length
+    # full text tf + doc length + stemmed tokens (reused for bigrams)
     full_text = soup.get_text(separator=" ", strip=True)
     tokens = tokenize(full_text)
     doc_length = len(tokens)
+    stemmed_tokens = [cached_stem(t) for t in tokens]
     term_tf: dict[str, int] = defaultdict(int)
-    for tok in tokens:
-        term_tf[cached_stem(tok)] += 1
+    for s in stemmed_tokens:
+        term_tf[s] += 1
 
-    return dict(term_tf), stem_max_tier, doc_length
+    return dict(term_tf), stem_max_tier, doc_length, stemmed_tokens
 
 
 def write_partial_index(partial_index: dict, partial_num: int) -> str:
@@ -241,7 +243,7 @@ def main():
         doc_id_map[doc_id] = url
 
         if content.strip():
-            term_tf, stem_max_tier, doc_length = parse_document(content)
+            term_tf, stem_max_tier, doc_length, stemmed_tokens = parse_document(content)
             doc_lengths[doc_id] = doc_length
 
             if term_tf:
@@ -250,6 +252,14 @@ def main():
             for term, tf in term_tf.items():
                 tier = stem_max_tier.get(term, TIER_BODY)
                 partial_index[term].append((doc_id, tf, tier))
+
+            # bigrams from consecutive stemmed tokens
+            bigram_tf: dict[str, int] = defaultdict(int)
+            for i in range(len(stemmed_tokens) - 1):
+                bg = f"{stemmed_tokens[i]}_{stemmed_tokens[i+1]}"
+                bigram_tf[bg] += 1
+            for bg, tf in bigram_tf.items():
+                partial_index[bg].append((doc_id, tf, TIER_BODY))
         else:
             doc_lengths[doc_id] = 0
 

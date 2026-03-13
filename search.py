@@ -251,12 +251,16 @@ def search(query: str, ioi: dict[str, int], doc_map: dict[int, str],
         pmap = {}
         posmap = {}
         for doc_id, tf, tier, positions in raw:
-            pmap[doc_id] = (tf, tier)
+            if doc_id in pmap:
+                old_tf, old_tier = pmap[doc_id]
+                pmap[doc_id] = (old_tf + tf, max(old_tier, tier))
+            else:
+                pmap[doc_id] = (tf, tier)
             if positions:
                 posmap[doc_id] = positions
         term_postings.append(pmap)
         term_positions.append(posmap)
-        df = max(len(raw), 1)
+        df = max(len(pmap), 1)
         idf = math.log((total_docs - df + 0.5) / (df + 0.5) + 1)
         term_idfs.append(idf)
 

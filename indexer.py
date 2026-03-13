@@ -10,9 +10,11 @@ reads from developer.zip, builds a disk-based inverted index with:
   - PageRank computation
 """
 
+import hashlib
 import json
 import os
 import re
+import struct
 import time
 import heapq
 import warnings
@@ -78,7 +80,7 @@ def compute_simhash(term_tf: dict[str, int]) -> int:
     """compute 64-bit SimHash fingerprint from term frequencies."""
     v = [0] * SIMHASH_BITS
     for term, tf in term_tf.items():
-        h = hash(term) & ((1 << SIMHASH_BITS) - 1)
+        h = struct.unpack("<Q", hashlib.md5(term.encode()).digest()[:8])[0]
         for i in range(SIMHASH_BITS):
             if h & (1 << i):
                 v[i] += tf
@@ -282,7 +284,7 @@ def main():
     url_to_doc_id: dict[str, int] = {}
     doc_lengths: dict[int, int] = {}
     fingerprints: dict[int, int] = {}
-    outlinks: dict[int, set[int]] = {}  # link graph for pagerank
+    raw_links: list[tuple[str, str]] = []  # (source_url, target_url) for post-loop resolution
     partial_index: dict[str, list] = defaultdict(list)
     partial_num = 0
     partial_paths: list[str] = []
@@ -323,17 +325,13 @@ def main():
             for bg, tf in bigram_tf.items():
                 partial_index[bg].append((doc_id, tf, TIER_BODY))
 
-            # collect anchor text + build link graph
+            # collect anchor text + raw links for post-loop resolution
             for href, anchor_stems in anchors:
                 try:
                     resolved = urljoin(url, href)
                     resolved = urldefrag(resolved)[0].rstrip("/").lower()
                     anchor_targets[resolved].extend(anchor_stems)
-                    target_did = url_to_doc_id.get(resolved)
-                    if target_did is not None and target_did != doc_id:
-                        if doc_id not in outlinks:
-                            outlinks[doc_id] = set()
-                        outlinks[doc_id].add(target_did)
+                    raw_links.append((clean_url, resolved))
                 except Exception:
                     pass
         else:
@@ -408,6 +406,18 @@ def main():
         for dup_id, canon_id in sorted(duplicates.items()):
             f.write(f"{dup_id}|{canon_id}\n")
     print(f"  Found {len(duplicates)} near-duplicates")
+
+    # resolve link graph post-loop (so forward links are captured)
+    print("Resolving link graph...")
+    outlinks: dict[int, set[int]] = {}
+    for src_url, tgt_url in raw_links:
+        src_did = url_to_doc_id.get(src_url)
+        tgt_did = url_to_doc_id.get(tgt_url)
+        if src_did is not None and tgt_did is not None and src_did != tgt_did:
+            if src_did not in outlinks:
+                outlinks[src_did] = set()
+            outlinks[src_did].add(tgt_did)
+    del raw_links
 
     # pagerank
     print("Computing PageRank...")

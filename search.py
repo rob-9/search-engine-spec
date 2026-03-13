@@ -1,7 +1,7 @@
 """
 search engine retrieval — assignment 3 m3
 BM25 ranking with tiered importance, OR fallback, dedup filtering,
-bigram boost, URL quality signal, and LRU postings cache.
+bigram boost, word position proximity, URL quality signal, and LRU postings cache.
 """
 
 import math
@@ -30,6 +30,9 @@ TIER_MULTIPLIERS = {
 # OR fallback threshold
 AND_MIN_RESULTS = 5
 AND_BONUS = 1.5
+
+# proximity weight
+PROXIMITY_WEIGHT = 2.0
 
 # LRU cache size
 CACHE_MAX = 1000
@@ -128,8 +131,8 @@ class PostingsCache:
 
 
 def fetch_postings(term: str, ioi: dict[str, int], index_fh,
-                   cache: PostingsCache) -> list[tuple[int, int, int]]:
-    """fetch postings for a term, using LRU cache."""
+                   cache: PostingsCache) -> list[tuple[int, int, int, list[int]]]:
+    """fetch postings for a term. returns list of (doc_id, tf, tier, positions)."""
     cached = cache.get(term)
     if cached is not None:
         return cached
@@ -146,10 +149,43 @@ def fetch_postings(term: str, ioi: dict[str, int], index_fh,
     postings = []
     for entry in postings_str.split(","):
         parts = entry.split(":")
-        postings.append((int(parts[0]), int(parts[1]), int(parts[2])))
+        doc_id = int(parts[0])
+        tf = int(parts[1])
+        tier = int(parts[2])
+        positions = []
+        if len(parts) > 3 and parts[3]:
+            positions = [int(p) for p in parts[3].split(".")]
+        postings.append((doc_id, tf, tier, positions))
 
     cache.put(term, postings)
     return postings
+
+
+def min_window_span(pos_lists: list[list[int]]) -> int:
+    """find minimum window span containing at least one position from each list."""
+    if not pos_lists or any(not pl for pl in pos_lists):
+        return -1
+
+    pointers = [0] * len(pos_lists)
+    min_span = float('inf')
+
+    while True:
+        positions = [pos_lists[i][pointers[i]] for i in range(len(pos_lists))]
+        span = max(positions) - min(positions)
+        min_span = min(min_span, span)
+        if min_span == 0:
+            return 0
+        min_idx = 0
+        min_val = positions[0]
+        for i in range(1, len(positions)):
+            if positions[i] < min_val:
+                min_val = positions[i]
+                min_idx = i
+        pointers[min_idx] += 1
+        if pointers[min_idx] >= len(pos_lists[min_idx]):
+            break
+
+    return min_span if min_span != float('inf') else -1
 
 
 def url_quality_score(url: str) -> float:
@@ -168,7 +204,7 @@ def search(query: str, ioi: dict[str, int], doc_map: dict[int, str],
            avgdl: float, duplicates: dict[int, int],
            cache: PostingsCache,
            url_to_did: dict[str, int] | None = None) -> list[tuple[str, float]]:
-    """BM25 search with AND→OR fallback, tiered importance, bigram boost, dedup."""
+    """BM25 search with proximity, tiered importance, bigram boost, dedup."""
     tokens = tokenize(query)
     if not tokens:
         return []
@@ -183,13 +219,20 @@ def search(query: str, ioi: dict[str, int], doc_map: dict[int, str],
 
     # fetch postings for each term
     term_postings: list[dict[int, tuple[int, int]]] = []
+    term_positions: list[dict[int, list[int]]] = []
     term_idfs: list[float] = []
 
     for stem in stems:
-        postings = fetch_postings(stem, ioi, index_fh, cache)
-        pmap = {doc_id: (tf, tier) for doc_id, tf, tier in postings}
+        raw = fetch_postings(stem, ioi, index_fh, cache)
+        pmap = {}
+        posmap = {}
+        for doc_id, tf, tier, positions in raw:
+            pmap[doc_id] = (tf, tier)
+            if positions:
+                posmap[doc_id] = positions
         term_postings.append(pmap)
-        df = max(len(postings), 1)
+        term_positions.append(posmap)
+        df = max(len(raw), 1)
         idf = math.log((total_docs - df + 0.5) / (df + 0.5) + 1)
         term_idfs.append(idf)
 
@@ -202,7 +245,7 @@ def search(query: str, ioi: dict[str, int], doc_map: dict[int, str],
         if bg_postings:
             bg_df = len(bg_postings)
             bg_idf = math.log((total_docs - bg_df + 0.5) / (bg_df + 0.5) + 1)
-            for doc_id, tf, tier in bg_postings:
+            for doc_id, tf, tier, _ in bg_postings:
                 dl = doc_lengths.get(doc_id, avgdl)
                 bm25 = bg_idf * (tf * (BM25_K1 + 1)) / (tf + BM25_K1 * (1 - BM25_B + BM25_B * dl / avgdl))
                 mult = TIER_MULTIPLIERS.get(tier, 1.0)
@@ -230,6 +273,13 @@ def search(query: str, ioi: dict[str, int], doc_map: dict[int, str],
             bm25 = term_idfs[i] * (tf * (BM25_K1 + 1)) / (tf + BM25_K1 * (1 - BM25_B + BM25_B * dl / avgdl))
             score += bm25 * TIER_MULTIPLIERS.get(tier, 1.0)
         score += bigram_docs.get(doc_id, 0.0)
+        # proximity bonus (multi-term queries)
+        if len(stems) >= 2:
+            pos_lists = [term_positions[i].get(doc_id, []) for i in range(len(stems))]
+            if all(pos_lists):
+                span = min_window_span(pos_lists)
+                if span >= 0:
+                    score += PROXIMITY_WEIGHT / (1 + span)
         url = doc_map.get(doc_id, "")
         score += url_quality_score(url)
         return score

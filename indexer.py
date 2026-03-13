@@ -6,6 +6,7 @@ reads from developer.zip, builds a disk-based inverted index with:
   - SimHash near-duplicate detection
   - bigram indexing
   - anchor text indexing
+  - word position indexing
 """
 
 import json
@@ -101,14 +102,16 @@ def parse_document(html: str):
                 if tier > stem_max_tier.get(s, -1):
                     stem_max_tier[s] = tier
 
-    # full text tf + doc length + stemmed tokens (reused for bigrams)
+    # full text: tf, positions, doc length
     full_text = soup.get_text(separator=" ", strip=True)
     tokens = tokenize(full_text)
     doc_length = len(tokens)
     stemmed_tokens = [cached_stem(t) for t in tokens]
     term_tf: dict[str, int] = defaultdict(int)
-    for s in stemmed_tokens:
+    term_positions: dict[str, list[int]] = defaultdict(list)
+    for pos, s in enumerate(stemmed_tokens):
         term_tf[s] += 1
+        term_positions[s].append(pos)
 
     # extract anchor text for outgoing links
     anchors = []
@@ -120,16 +123,24 @@ def parse_document(html: str):
             if anchor_stems:
                 anchors.append((href, anchor_stems))
 
-    return dict(term_tf), stem_max_tier, doc_length, stemmed_tokens, anchors
+    return dict(term_tf), stem_max_tier, doc_length, stemmed_tokens, dict(term_positions), anchors
 
 
 def write_partial_index(partial_index: dict, partial_num: int) -> str:
+    """write sorted partial index. posting format: doc:tf:tier[:positions]."""
     path = INDEX_DIR / f"partial_{partial_num}.txt"
     with open(path, "w", encoding="utf-8") as f:
         for term in sorted(partial_index.keys()):
             postings = partial_index[term]
-            posting_strs = [f"{did}:{tf}:{tier}" for did, tf, tier in postings]
-            f.write(f"{term}|{','.join(posting_strs)}\n")
+            strs = []
+            for entry in postings:
+                did, tf, tier = entry[0], entry[1], entry[2]
+                positions = entry[3] if len(entry) > 3 else []
+                if positions:
+                    strs.append(f"{did}:{tf}:{tier}:{'.'.join(map(str, positions))}")
+                else:
+                    strs.append(f"{did}:{tf}:{tier}")
+            f.write(f"{term}|{','.join(strs)}\n")
     return str(path)
 
 
@@ -259,7 +270,7 @@ def main():
         url_to_doc_id[clean_url] = doc_id
 
         if content.strip():
-            term_tf, stem_max_tier, doc_length, stemmed_tokens, anchors = parse_document(content)
+            term_tf, stem_max_tier, doc_length, stemmed_tokens, term_positions, anchors = parse_document(content)
             doc_lengths[doc_id] = doc_length
 
             if term_tf:
@@ -267,7 +278,8 @@ def main():
 
             for term, tf in term_tf.items():
                 tier = stem_max_tier.get(term, TIER_BODY)
-                partial_index[term].append((doc_id, tf, tier))
+                positions = term_positions.get(term, [])
+                partial_index[term].append((doc_id, tf, tier, positions))
 
             # bigrams from consecutive stemmed tokens
             bigram_tf: dict[str, int] = defaultdict(int)

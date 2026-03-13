@@ -7,6 +7,7 @@ reads from developer.zip, builds a disk-based inverted index with:
   - bigram indexing
   - anchor text indexing
   - word position indexing
+  - PageRank computation
 """
 
 import json
@@ -50,6 +51,10 @@ TAG_TIERS = {
 SIMHASH_BITS = 64
 HAMMING_THRESHOLD = 3
 
+# pagerank constants
+PR_DAMPING = 0.85
+PR_ITERATIONS = 25
+
 # globals
 stemmer = PorterStemmer()
 stem_cache: dict[str, str] = {}
@@ -86,6 +91,28 @@ def compute_simhash(term_tf: dict[str, int]) -> int:
 
 def hamming_distance(a: int, b: int) -> int:
     return bin(a ^ b).count("1")
+
+
+def compute_pagerank(outlinks: dict[int, set[int]], total_docs: int) -> list[float]:
+    """compute pagerank scores using power iteration."""
+    pr = [1.0 / total_docs] * total_docs
+    for _ in range(PR_ITERATIONS):
+        dangling_sum = sum(
+            pr[i] for i in range(total_docs)
+            if i not in outlinks or not outlinks[i]
+        )
+        dangling_contrib = PR_DAMPING * dangling_sum / total_docs
+        base = (1 - PR_DAMPING) / total_docs + dangling_contrib
+        new_pr = [base] * total_docs
+        for src, targets in outlinks.items():
+            if not targets:
+                continue
+            share = PR_DAMPING * pr[src] / len(targets)
+            for target in targets:
+                if target < total_docs:
+                    new_pr[target] += share
+        pr = new_pr
+    return pr
 
 
 def parse_document(html: str):
@@ -249,6 +276,7 @@ def main():
     url_to_doc_id: dict[str, int] = {}
     doc_lengths: dict[int, int] = {}
     fingerprints: dict[int, int] = {}
+    outlinks: dict[int, set[int]] = {}  # link graph for pagerank
     partial_index: dict[str, list] = defaultdict(list)
     partial_num = 0
     partial_paths: list[str] = []
@@ -289,12 +317,17 @@ def main():
             for bg, tf in bigram_tf.items():
                 partial_index[bg].append((doc_id, tf, TIER_BODY))
 
-            # collect anchor text for target resolution
+            # collect anchor text + build link graph
             for href, anchor_stems in anchors:
                 try:
                     resolved = urljoin(url, href)
                     resolved = urldefrag(resolved)[0].rstrip("/").lower()
                     anchor_targets[resolved].extend(anchor_stems)
+                    target_did = url_to_doc_id.get(resolved)
+                    if target_did is not None and target_did != doc_id:
+                        if doc_id not in outlinks:
+                            outlinks[doc_id] = set()
+                        outlinks[doc_id].add(target_did)
                 except Exception:
                     pass
         else:
@@ -370,6 +403,17 @@ def main():
             f.write(f"{dup_id}|{canon_id}\n")
     print(f"  Found {len(duplicates)} near-duplicates")
 
+    # pagerank
+    print("Computing PageRank...")
+    link_count = sum(len(targets) for targets in outlinks.values())
+    pr_scores = compute_pagerank(outlinks, doc_id)
+    with open(INDEX_DIR / "pagerank.txt", "w", encoding="utf-8") as f:
+        for did in range(doc_id):
+            f.write(f"{did}|{pr_scores[did]:.10f}\n")
+    top_pr = sorted(range(doc_id), key=lambda i: pr_scores[i], reverse=True)[:5]
+    print(f"  {len(outlinks)} docs with outlinks, {link_count} edges")
+    print(f"  Top PR: {[(doc_id_map[d], f'{pr_scores[d]:.6f}') for d in top_pr]}")
+
     # compute index size
     index_size_bytes = os.path.getsize(INDEX_DIR / "index.txt")
     index_size_kb = index_size_bytes / 1024
@@ -383,6 +427,7 @@ def main():
         f.write(f"partial_indexes: {partial_num}\n")
         f.write(f"total_time_s: {time.time() - start:.1f}\n")
         f.write(f"near_duplicates: {len(duplicates)}\n")
+        f.write(f"link_edges: {link_count}\n")
 
     # clean up partial files
     for path in partial_paths:
@@ -395,6 +440,7 @@ def main():
     print(f"  Index size on disk: {index_size_kb:.1f} KB ({index_size_kb/1024:.1f} MB)")
     print(f"  Partial offloads  : {partial_num}")
     print(f"  Near-duplicates   : {len(duplicates)}")
+    print(f"  Link edges        : {link_count}")
     print(f"  Total time        : {total_time:.1f}s")
     print(f"{'='*50}")
 

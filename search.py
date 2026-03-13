@@ -1,7 +1,8 @@
 """
 search engine retrieval — assignment 3 m3
 BM25 ranking with tiered importance, OR fallback, dedup filtering,
-bigram boost, word position proximity, URL quality signal, and LRU postings cache.
+bigram boost, word position proximity, PageRank, URL quality signal,
+and LRU postings cache.
 """
 
 import math
@@ -31,7 +32,8 @@ TIER_MULTIPLIERS = {
 AND_MIN_RESULTS = 5
 AND_BONUS = 1.5
 
-# proximity weight
+# scoring weights
+PAGERANK_WEIGHT = 500.0
 PROXIMITY_WEIGHT = 2.0
 
 # LRU cache size
@@ -98,6 +100,19 @@ def load_duplicates() -> dict[int, int]:
             sep = line.index("|")
             dups[int(line[:sep])] = int(line[sep + 1:])
     return dups
+
+
+def load_pagerank() -> dict[int, float]:
+    pr = {}
+    path = INDEX_DIR / "pagerank.txt"
+    if not path.exists():
+        return pr
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.rstrip("\n")
+            sep = line.index("|")
+            pr[int(line[:sep])] = float(line[sep + 1:])
+    return pr
 
 
 def load_total_docs() -> int:
@@ -203,7 +218,8 @@ def search(query: str, ioi: dict[str, int], doc_map: dict[int, str],
            total_docs: int, index_fh, doc_lengths: dict[int, int],
            avgdl: float, duplicates: dict[int, int],
            cache: PostingsCache,
-           url_to_did: dict[str, int] | None = None) -> list[tuple[str, float]]:
+           url_to_did: dict[str, int] | None = None,
+           pagerank: dict[int, float] | None = None) -> list[tuple[str, float]]:
     """BM25 search with proximity, tiered importance, bigram boost, dedup."""
     tokens = tokenize(query)
     if not tokens:
@@ -280,6 +296,8 @@ def search(query: str, ioi: dict[str, int], doc_map: dict[int, str],
                 span = min_window_span(pos_lists)
                 if span >= 0:
                     score += PROXIMITY_WEIGHT / (1 + span)
+        if pagerank:
+            score += pagerank.get(doc_id, 0.0) * PAGERANK_WEIGHT
         url = doc_map.get(doc_id, "")
         score += url_quality_score(url)
         return score
@@ -329,6 +347,7 @@ def main():
     total_docs = load_total_docs()
     doc_lengths = load_doc_lengths()
     duplicates = load_duplicates()
+    pagerank = load_pagerank()
     index_fh = open(INDEX_DIR / "index.txt", "rb")
     cache = PostingsCache()
 
@@ -357,7 +376,8 @@ def main():
 
         t_start = time.time()
         results = search(query, ioi, doc_map, total_docs, index_fh,
-                         doc_lengths, avgdl, duplicates, cache, url_to_did)
+                         doc_lengths, avgdl, duplicates, cache,
+                         url_to_did, pagerank)
         t_end = time.time()
 
         elapsed_ms = (t_end - t_start) * 1000

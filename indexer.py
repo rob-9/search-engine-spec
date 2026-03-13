@@ -1,6 +1,9 @@
 """
-inverted index builder — assignment 3 m1
-reads from developer.zip, builds a disk-based inverted index with partial offloading.
+inverted index builder — assignment 3 m3
+reads from developer.zip, builds a disk-based inverted index with:
+  - tiered importance scoring (0-3)
+  - document length tracking for BM25
+  - SimHash near-duplicate detection
 """
 
 import json
@@ -8,19 +11,40 @@ import os
 import re
 import time
 import heapq
+import warnings
 import zipfile
 from collections import defaultdict
 from pathlib import Path
 
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, MarkupResemblesLocatorWarning, XMLParsedAsHTMLWarning
 from nltk.stem import PorterStemmer
 
-# configuration
-CORPUS_ZIP = "developer.zip"
-INDEX_DIR = Path("index")
-BATCH_SIZE = 18_000  # docs per partial index (ensures >= 3 offloads for ~55k docs)
+warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
+warnings.filterwarnings("ignore", category=MarkupResemblesLocatorWarning)
 
-IMPORTANT_TAGS = {"title", "h1", "h2", "h3", "b", "strong"}
+# configuration
+CORPUS_ZIP = "/Users/robert/Downloads/developer.zip"
+INDEX_DIR = Path("index")
+BATCH_SIZE = 18_000
+
+# importance tiers
+TIER_TITLE = 3
+TIER_H1 = 2
+TIER_EMPHASIS = 1  # h2, h3, b, strong
+TIER_BODY = 0
+
+TAG_TIERS = {
+    "title": TIER_TITLE,
+    "h1": TIER_H1,
+    "h2": TIER_EMPHASIS,
+    "h3": TIER_EMPHASIS,
+    "b": TIER_EMPHASIS,
+    "strong": TIER_EMPHASIS,
+}
+
+# simhash constants
+SIMHASH_BITS = 64
+HAMMING_THRESHOLD = 3
 
 # globals
 stemmer = PorterStemmer()
@@ -28,7 +52,6 @@ stem_cache: dict[str, str] = {}
 
 
 def cached_stem(token: str) -> str:
-    """porter-stem with memoisation."""
     s = stem_cache.get(token)
     if s is None:
         s = stemmer.stem(token)
@@ -37,64 +60,77 @@ def cached_stem(token: str) -> str:
 
 
 def tokenize(text: str) -> list[str]:
-    """return lowercased alphanumeric tokens."""
     return re.findall(r"[a-zA-Z0-9]+", text.lower())
 
 
+def compute_simhash(term_tf: dict[str, int]) -> int:
+    """compute 64-bit SimHash fingerprint from term frequencies."""
+    v = [0] * SIMHASH_BITS
+    for term, tf in term_tf.items():
+        h = hash(term) & ((1 << SIMHASH_BITS) - 1)
+        for i in range(SIMHASH_BITS):
+            if h & (1 << i):
+                v[i] += tf
+            else:
+                v[i] -= tf
+    fingerprint = 0
+    for i in range(SIMHASH_BITS):
+        if v[i] > 0:
+            fingerprint |= (1 << i)
+    return fingerprint
+
+
+def hamming_distance(a: int, b: int) -> int:
+    return bin(a ^ b).count("1")
+
+
 def parse_document(html: str):
-    """
-    returns (term_tf: dict[str,int], important_stems: set[str]).
-    term_tf maps stemmed token -> raw term frequency.
-    important_stems is the set of stems that appeared in important tags.
-    """
+    """returns (term_tf, stem_max_tier, doc_length)."""
     soup = BeautifulSoup(html, "lxml")
 
-    # important stems
-    important_stems: set[str] = set()
-    for tag_name in IMPORTANT_TAGS:
+    # tiered importance: track max tier per stem
+    stem_max_tier: dict[str, int] = {}
+    for tag_name, tier in TAG_TIERS.items():
         for tag in soup.find_all(tag_name):
             text = tag.get_text(separator=" ", strip=True)
             for tok in tokenize(text):
-                important_stems.add(cached_stem(tok))
+                s = cached_stem(tok)
+                if tier > stem_max_tier.get(s, -1):
+                    stem_max_tier[s] = tier
 
-    # full text tf
+    # full text tf + doc length
     full_text = soup.get_text(separator=" ", strip=True)
+    tokens = tokenize(full_text)
+    doc_length = len(tokens)
     term_tf: dict[str, int] = defaultdict(int)
-    for tok in tokenize(full_text):
+    for tok in tokens:
         term_tf[cached_stem(tok)] += 1
 
-    return dict(term_tf), important_stems
+    return dict(term_tf), stem_max_tier, doc_length
 
 
 def write_partial_index(partial_index: dict, partial_num: int) -> str:
-    """write sorted partial index to disk. returns file path."""
     path = INDEX_DIR / f"partial_{partial_num}.txt"
     with open(path, "w", encoding="utf-8") as f:
         for term in sorted(partial_index.keys()):
             postings = partial_index[term]
-            # postings: list of (doc_id, tf, important)
-            posting_strs = [f"{did}:{tf}:{imp}" for did, tf, imp in postings]
+            posting_strs = [f"{did}:{tf}:{tier}" for did, tf, tier in postings]
             f.write(f"{term}|{','.join(posting_strs)}\n")
     return str(path)
 
 
 def parse_posting_line(line: str):
-    """parse a line from a partial index file. returns (term, postings_str)."""
     sep = line.index("|")
     return line[:sep], line[sep + 1:]
 
 
 def merge_partial_indexes(partial_paths: list[str]):
-    """k-way merge of sorted partial index files into final index.txt.
-    also builds index_of_index.txt with byte offsets."""
-
     index_path = INDEX_DIR / "index.txt"
     ioi_path = INDEX_DIR / "index_of_index.txt"
     unique_terms = 0
 
-    # open all partial files
     file_handles = []
-    heap = []  # (term, postings_str, file_index)
+    heap = []
 
     for i, path in enumerate(partial_paths):
         fh = open(path, "r", encoding="utf-8")
@@ -106,7 +142,6 @@ def merge_partial_indexes(partial_paths: list[str]):
 
     heapq.heapify(heap)
 
-    # write merged index in binary mode for accurate byte offsets
     with open(index_path, "wb") as idx_f, open(ioi_path, "w", encoding="utf-8") as ioi_f:
         current_term = None
         current_postings: list[str] = []
@@ -124,7 +159,6 @@ def merge_partial_indexes(partial_paths: list[str]):
         while heap:
             term, postings_str, fi = heapq.heappop(heap)
 
-            # advance that file
             line = file_handles[fi].readline()
             if line:
                 next_term, next_postings = parse_posting_line(line.rstrip("\n"))
@@ -137,12 +171,43 @@ def merge_partial_indexes(partial_paths: list[str]):
                 current_term = term
                 current_postings = [postings_str]
 
-        flush_term()  # last term
+        flush_term()
 
     for fh in file_handles:
         fh.close()
 
     return unique_terms
+
+
+def find_duplicates(fingerprints: dict[int, int]) -> dict[int, int]:
+    """find near-duplicate documents using multi-band SimHash.
+    returns dict mapping duplicate doc_id -> canonical doc_id."""
+    duplicates = {}
+    items = sorted(fingerprints.items())
+
+    num_bands = 4
+    band_bits = SIMHASH_BITS // num_bands
+    band_tables: list[dict[int, list[tuple[int, int]]]] = [defaultdict(list) for _ in range(num_bands)]
+    for doc_id, fp in items:
+        for b in range(num_bands):
+            band_key = (fp >> (b * band_bits)) & ((1 << band_bits) - 1)
+            band_tables[b][band_key].append((doc_id, fp))
+
+    for doc_id, fp in items:
+        if doc_id in duplicates:
+            continue
+        candidates = set()
+        for b in range(num_bands):
+            band_key = (fp >> (b * band_bits)) & ((1 << band_bits) - 1)
+            for other_id, _ in band_tables[b][band_key]:
+                if other_id < doc_id and other_id not in duplicates:
+                    candidates.add(other_id)
+        for other_id in sorted(candidates):
+            if hamming_distance(fp, fingerprints[other_id]) <= HAMMING_THRESHOLD:
+                duplicates[doc_id] = other_id
+                break
+
+    return duplicates
 
 
 def main():
@@ -155,13 +220,15 @@ def main():
     total_docs = len(json_files)
     print(f"Found {total_docs} JSON files")
 
-    doc_id_map: dict[int, str] = {}  # doc_id -> url
-    partial_index: dict[str, list] = defaultdict(list)  # term -> [(doc_id, tf, imp)]
+    doc_id_map: dict[int, str] = {}
+    doc_lengths: dict[int, int] = {}
+    fingerprints: dict[int, int] = {}
+    partial_index: dict[str, list] = defaultdict(list)
     partial_num = 0
     partial_paths: list[str] = []
     doc_id = 0
 
-    for _, jf in enumerate(json_files):
+    for jf in json_files:
         try:
             raw = zf.read(jf)
             data = json.loads(raw)
@@ -174,19 +241,24 @@ def main():
         doc_id_map[doc_id] = url
 
         if content.strip():
-            term_tf, important_stems = parse_document(content)
+            term_tf, stem_max_tier, doc_length = parse_document(content)
+            doc_lengths[doc_id] = doc_length
+
+            if term_tf:
+                fingerprints[doc_id] = compute_simhash(term_tf)
+
             for term, tf in term_tf.items():
-                imp = 1 if term in important_stems else 0
-                partial_index[term].append((doc_id, tf, imp))
+                tier = stem_max_tier.get(term, TIER_BODY)
+                partial_index[term].append((doc_id, tf, tier))
+        else:
+            doc_lengths[doc_id] = 0
 
         doc_id += 1
 
-        # progress
         if doc_id % 5000 == 0:
             elapsed = time.time() - start
             print(f"  Processed {doc_id}/{total_docs} docs  ({elapsed:.1f}s)")
 
-        # offload partial index
         if doc_id % BATCH_SIZE == 0:
             print(f"  >> Offloading partial index {partial_num} ({len(partial_index)} terms, doc {doc_id})")
             path = write_partial_index(partial_index, partial_num)
@@ -216,17 +288,32 @@ def main():
         for did in range(len(doc_id_map)):
             f.write(f"{did}|{doc_id_map[did]}\n")
 
+    # write doc_lengths
+    with open(INDEX_DIR / "doc_lengths.txt", "w", encoding="utf-8") as f:
+        for did in range(len(doc_id_map)):
+            f.write(f"{did}|{doc_lengths.get(did, 0)}\n")
+
+    # simhash duplicate detection
+    print("Detecting near-duplicates via SimHash...")
+    duplicates = find_duplicates(fingerprints)
+    with open(INDEX_DIR / "duplicates.txt", "w", encoding="utf-8") as f:
+        for dup_id, canon_id in sorted(duplicates.items()):
+            f.write(f"{dup_id}|{canon_id}\n")
+    print(f"  Found {len(duplicates)} near-duplicates")
+
     # compute index size
     index_size_bytes = os.path.getsize(INDEX_DIR / "index.txt")
     index_size_kb = index_size_bytes / 1024
 
     # write metadata
     with open(INDEX_DIR / "metadata.txt", "w", encoding="utf-8") as f:
+        f.write("group ids\n35485800, 79822855, 30679988, 32438497\n\n")
         f.write(f"documents: {doc_id}\n")
         f.write(f"unique_terms: {unique_terms}\n")
         f.write(f"index_size_kb: {index_size_kb:.1f}\n")
         f.write(f"partial_indexes: {partial_num}\n")
         f.write(f"total_time_s: {time.time() - start:.1f}\n")
+        f.write(f"near_duplicates: {len(duplicates)}\n")
 
     # clean up partial files
     for path in partial_paths:
@@ -238,6 +325,7 @@ def main():
     print(f"  Unique terms      : {unique_terms}")
     print(f"  Index size on disk: {index_size_kb:.1f} KB ({index_size_kb/1024:.1f} MB)")
     print(f"  Partial offloads  : {partial_num}")
+    print(f"  Near-duplicates   : {len(duplicates)}")
     print(f"  Total time        : {total_time:.1f}s")
     print(f"{'='*50}")
 

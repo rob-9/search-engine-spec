@@ -1,18 +1,38 @@
 """
-search engine retrieval component — assignment 3 m2
-boolean AND retrieval with tf-idf ranking over disk-based inverted index.
+search engine retrieval — assignment 3 m3
+BM25 ranking with tiered importance, OR fallback, dedup filtering,
+URL quality signal, and LRU postings cache.
 """
 
 import math
 import re
 import time
+from collections import OrderedDict
 from pathlib import Path
 
 from nltk.stem import PorterStemmer
 
 # configuration
 INDEX_DIR = Path("index")
-IMPORTANCE_BOOST = 1.5  # multiplier for terms found in important tags
+
+# BM25 parameters
+BM25_K1 = 1.2
+BM25_B = 0.75
+
+# tiered importance multipliers
+TIER_MULTIPLIERS = {
+    3: 3.0,   # title
+    2: 2.0,   # h1
+    1: 1.5,   # h2, h3, b, strong
+    0: 1.0,   # body
+}
+
+# OR fallback threshold
+AND_MIN_RESULTS = 5
+AND_BONUS = 1.5
+
+# LRU cache size
+CACHE_MAX = 1000
 
 # globals
 stemmer = PorterStemmer()
@@ -32,29 +52,49 @@ def tokenize(text: str) -> list[str]:
 
 
 def load_index_of_index() -> dict[str, int]:
-    """load term -> byte offset mapping into memory."""
     ioi = {}
     with open(INDEX_DIR / "index_of_index.txt", "r", encoding="utf-8") as f:
         for line in f:
             line = line.rstrip("\n")
             sep = line.index("|")
-            term = line[:sep]
-            offset = int(line[sep + 1:])
-            ioi[term] = offset
+            ioi[line[:sep]] = int(line[sep + 1:])
     return ioi
 
 
 def load_doc_id_map() -> dict[int, str]:
-    """load doc_id -> url mapping."""
     doc_map = {}
     with open(INDEX_DIR / "doc_id_map.txt", "r", encoding="utf-8") as f:
         for line in f:
             line = line.rstrip("\n")
             sep = line.index("|")
-            did = int(line[:sep])
-            url = line[sep + 1:]
-            doc_map[did] = url
+            doc_map[int(line[:sep])] = line[sep + 1:]
     return doc_map
+
+
+def load_doc_lengths() -> dict[int, int]:
+    lengths = {}
+    path = INDEX_DIR / "doc_lengths.txt"
+    if not path.exists():
+        return lengths
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.rstrip("\n")
+            sep = line.index("|")
+            lengths[int(line[:sep])] = int(line[sep + 1:])
+    return lengths
+
+
+def load_duplicates() -> dict[int, int]:
+    dups = {}
+    path = INDEX_DIR / "duplicates.txt"
+    if not path.exists():
+        return dups
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.rstrip("\n")
+            sep = line.index("|")
+            dups[int(line[:sep])] = int(line[sep + 1:])
+    return dups
 
 
 def load_total_docs() -> int:
@@ -65,9 +105,35 @@ def load_total_docs() -> int:
     return 0
 
 
-def fetch_postings(term: str, ioi: dict[str, int], index_fh) -> list[tuple[int, int, int]]:
-    """seek into index.txt and read postings for a term.
-    returns list of (doc_id, tf, important)."""
+class PostingsCache:
+    """LRU cache for postings lookups to avoid redundant disk seeks."""
+
+    def __init__(self, maxsize: int = CACHE_MAX):
+        self._cache: OrderedDict[str, list] = OrderedDict()
+        self._maxsize = maxsize
+
+    def get(self, term: str):
+        if term in self._cache:
+            self._cache.move_to_end(term)
+            return self._cache[term]
+        return None
+
+    def put(self, term: str, postings: list):
+        if term in self._cache:
+            self._cache.move_to_end(term)
+        else:
+            if len(self._cache) >= self._maxsize:
+                self._cache.popitem(last=False)
+            self._cache[term] = postings
+
+
+def fetch_postings(term: str, ioi: dict[str, int], index_fh,
+                   cache: PostingsCache) -> list[tuple[int, int, int]]:
+    """fetch postings for a term, using LRU cache."""
+    cached = cache.get(term)
+    if cached is not None:
+        return cached
+
     offset = ioi.get(term)
     if offset is None:
         return []
@@ -80,69 +146,113 @@ def fetch_postings(term: str, ioi: dict[str, int], index_fh) -> list[tuple[int, 
     postings = []
     for entry in postings_str.split(","):
         parts = entry.split(":")
-        doc_id = int(parts[0])
-        tf = int(parts[1])
-        imp = int(parts[2])
-        postings.append((doc_id, tf, imp))
+        postings.append((int(parts[0]), int(parts[1]), int(parts[2])))
+
+    cache.put(term, postings)
     return postings
 
 
-def boolean_and_search(query: str, ioi: dict[str, int], doc_map: dict[int, str],
-                       total_docs: int, index_fh) -> list[tuple[str, float]]:
-    """perform AND retrieval with tf-idf ranking.
-    returns list of (url, score) sorted by descending score."""
+def url_quality_score(url: str) -> float:
+    """small additive bonus for URL quality signals."""
+    bonus = 0.0
+    path = url.split("//", 1)[-1] if "//" in url else url
+    depth = path.count("/")
+    bonus += max(0, 0.3 - depth * 0.05)
+    if ".edu" in url.lower():
+        bonus += 0.15
+    return bonus
+
+
+def search(query: str, ioi: dict[str, int], doc_map: dict[int, str],
+           total_docs: int, index_fh, doc_lengths: dict[int, int],
+           avgdl: float, duplicates: dict[int, int],
+           cache: PostingsCache,
+           url_to_did: dict[str, int] | None = None) -> list[tuple[str, float]]:
+    """BM25 search with AND→OR fallback, tiered importance, dedup."""
     tokens = tokenize(query)
     if not tokens:
         return []
 
-    stems = [cached_stem(t) for t in tokens]
-    # deduplicate while preserving order
+    stems = []
     seen = set()
-    unique_stems = []
-    for s in stems:
+    for t in tokens:
+        s = cached_stem(t)
         if s not in seen:
             seen.add(s)
-            unique_stems.append(s)
+            stems.append(s)
 
     # fetch postings for each term
-    term_postings: list[dict[int, tuple[int, int]]] = []  # [{doc_id: (tf, imp)}]
+    term_postings: list[dict[int, tuple[int, int]]] = []
     term_idfs: list[float] = []
 
-    for stem in unique_stems:
-        postings = fetch_postings(stem, ioi, index_fh)
-        if not postings:
-            return []  # AND semantics: if any term missing, no results
-        pmap = {doc_id: (tf, imp) for doc_id, tf, imp in postings}
+    for stem in stems:
+        postings = fetch_postings(stem, ioi, index_fh, cache)
+        pmap = {doc_id: (tf, tier) for doc_id, tf, tier in postings}
         term_postings.append(pmap)
-        df = len(postings)
-        idf = math.log(total_docs / df)
+        df = max(len(postings), 1)
+        idf = math.log((total_docs - df + 0.5) / (df + 0.5) + 1)
         term_idfs.append(idf)
 
-    # intersect: start with smallest posting list
-    order = sorted(range(len(term_postings)), key=lambda i: len(term_postings[i]))
-    candidate_docs = set(term_postings[order[0]].keys())
-    for i in order[1:]:
-        candidate_docs &= term_postings[i].keys()
-        if not candidate_docs:
-            return []
+    # AND intersection
+    non_empty = [tp for tp in term_postings if tp]
+    if len(non_empty) == len(stems) and len(stems) > 0:
+        order = sorted(range(len(term_postings)), key=lambda i: len(term_postings[i]))
+        candidate_docs = set(term_postings[order[0]].keys())
+        for i in order[1:]:
+            candidate_docs &= term_postings[i].keys()
+    else:
+        candidate_docs = set()
 
-    # score each candidate
-    scored = []
-    for doc_id in candidate_docs:
+    use_or = len(candidate_docs) < AND_MIN_RESULTS
+
+    def score_doc(doc_id: int) -> float:
         score = 0.0
-        for i, stem in enumerate(unique_stems):
-            tf, imp = term_postings[i][doc_id]
-            tf_weight = 1 + math.log(tf) if tf > 0 else 0
-            idf = term_idfs[i]
-            term_score = tf_weight * idf
-            if imp:
-                term_score *= IMPORTANCE_BOOST
-            score += term_score
-        url = doc_map.get(doc_id, f"doc_{doc_id}")
-        scored.append((url, score))
+        for i in range(len(stems)):
+            if doc_id not in term_postings[i]:
+                continue
+            tf, tier = term_postings[i][doc_id]
+            dl = doc_lengths.get(doc_id, avgdl)
+            bm25 = term_idfs[i] * (tf * (BM25_K1 + 1)) / (tf + BM25_K1 * (1 - BM25_B + BM25_B * dl / avgdl))
+            score += bm25 * TIER_MULTIPLIERS.get(tier, 1.0)
+        url = doc_map.get(doc_id, "")
+        score += url_quality_score(url)
+        return score
 
+    if use_or:
+        all_doc_ids: set[int] = set()
+        for tp in term_postings:
+            all_doc_ids.update(tp.keys())
+        scored = []
+        for doc_id in all_doc_ids:
+            sc = score_doc(doc_id)
+            if doc_id in candidate_docs:
+                sc *= AND_BONUS
+            scored.append((doc_map.get(doc_id, f"doc_{doc_id}"), sc))
+    else:
+        scored = [(doc_map.get(doc_id, f"doc_{doc_id}"), score_doc(doc_id))
+                  for doc_id in candidate_docs]
+
+    # filter duplicates
+    filtered = []
+    seen_canonical = set()
     scored.sort(key=lambda x: -x[1])
-    return scored
+    for url, sc in scored:
+        if not url_to_did or not duplicates:
+            filtered.append((url, sc))
+            continue
+        did = url_to_did.get(url)
+        if did is not None and did in duplicates:
+            canon = duplicates[did]
+            if canon in seen_canonical:
+                continue
+            seen_canonical.add(canon)
+        elif did is not None:
+            if did in seen_canonical:
+                continue
+            seen_canonical.add(did)
+        filtered.append((url, sc))
+
+    return filtered
 
 
 def main():
@@ -151,9 +261,20 @@ def main():
     ioi = load_index_of_index()
     doc_map = load_doc_id_map()
     total_docs = load_total_docs()
+    doc_lengths = load_doc_lengths()
+    duplicates = load_duplicates()
     index_fh = open(INDEX_DIR / "index.txt", "rb")
+    cache = PostingsCache()
+
+    url_to_did = {url: did for did, url in doc_map.items()}
+
+    if doc_lengths:
+        avgdl = sum(doc_lengths.values()) / len(doc_lengths)
+    else:
+        avgdl = 1.0
+
     t1 = time.time()
-    print(f"Ready. {len(ioi)} terms, {total_docs} docs loaded in {t1 - t0:.2f}s\n")
+    print(f"Ready. {len(ioi)} terms, {total_docs} docs, {len(duplicates)} dups loaded in {t1 - t0:.2f}s\n")
 
     while True:
         try:
@@ -169,7 +290,8 @@ def main():
             break
 
         t_start = time.time()
-        results = boolean_and_search(query, ioi, doc_map, total_docs, index_fh)
+        results = search(query, ioi, doc_map, total_docs, index_fh,
+                         doc_lengths, avgdl, duplicates, cache, url_to_did)
         t_end = time.time()
 
         elapsed_ms = (t_end - t_start) * 1000
@@ -181,6 +303,8 @@ def main():
 
         for rank, (url, score) in enumerate(results[:5], 1):
             print(f"  {rank}. {url}  (score: {score:.4f})")
+        if len(results) > 5:
+            print(f"  ... and {len(results) - 5} more")
         print()
 
     index_fh.close()

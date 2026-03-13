@@ -5,6 +5,7 @@ bigram boost, word position proximity, PageRank, URL quality signal,
 and LRU postings cache.
 """
 
+import heapq
 import math
 import re
 import time
@@ -154,8 +155,9 @@ class PostingsCache:
 
 
 def fetch_postings(term: str, ioi: dict[str, int], index_fh,
-                   cache: PostingsCache) -> list[tuple[int, int, int, list[int]]]:
-    """fetch postings for a term. returns list of (doc_id, tf, tier, positions)."""
+                   cache: PostingsCache) -> list[tuple[int, int, int, str]]:
+    """fetch postings for a term. returns list of (doc_id, tf, tier, raw_positions_str).
+    positions are kept as raw strings for lazy parsing — only parsed when needed."""
     cached = cache.get(term)
     if cached is not None:
         return cached
@@ -175,10 +177,8 @@ def fetch_postings(term: str, ioi: dict[str, int], index_fh,
         doc_id = int(parts[0])
         tf = int(parts[1])
         tier = int(parts[2])
-        positions = []
-        if len(parts) > 3 and parts[3]:
-            positions = [int(p) for p in parts[3].split(".")]
-        postings.append((doc_id, tf, tier, positions))
+        raw_pos = parts[3] if len(parts) > 3 else ""
+        postings.append((doc_id, tf, tier, raw_pos))
 
     cache.put(term, postings)
     return postings
@@ -250,14 +250,14 @@ def search(query: str, ioi: dict[str, int], doc_map: dict[int, str],
         raw = fetch_postings(stem, ioi, index_fh, cache)
         pmap = {}
         posmap = {}
-        for doc_id, tf, tier, positions in raw:
+        for doc_id, tf, tier, raw_pos in raw:
             if doc_id in pmap:
                 old_tf, old_tier = pmap[doc_id]
                 pmap[doc_id] = (old_tf + tf, max(old_tier, tier))
             else:
                 pmap[doc_id] = (tf, tier)
-            if positions:
-                posmap[doc_id] = positions
+            if raw_pos:
+                posmap[doc_id] = raw_pos
         term_postings.append(pmap)
         term_positions.append(posmap)
         df = max(len(pmap), 1)
@@ -291,7 +291,7 @@ def search(query: str, ioi: dict[str, int], doc_map: dict[int, str],
 
     use_or = len(candidate_docs) < AND_MIN_RESULTS
 
-    def score_doc(doc_id: int) -> float:
+    def score_doc(doc_id: int, skip_proximity: bool = False) -> float:
         score = 0.0
         for i in range(len(stems)):
             if doc_id not in term_postings[i]:
@@ -301,9 +301,12 @@ def search(query: str, ioi: dict[str, int], doc_map: dict[int, str],
             bm25 = term_idfs[i] * (tf * (BM25_K1 + 1)) / (tf + BM25_K1 * (1 - BM25_B + BM25_B * dl / avgdl))
             score += bm25 * TIER_MULTIPLIERS.get(tier, 1.0)
         score += bigram_docs.get(doc_id, 0.0)
-        # proximity bonus (multi-term queries)
-        if len(stems) >= 2:
-            pos_lists = [term_positions[i].get(doc_id, []) for i in range(len(stems))]
+        # proximity bonus (multi-term queries, skip for OR-only single-match docs)
+        if not skip_proximity and len(stems) >= 2:
+            pos_lists = []
+            for i in range(len(stems)):
+                raw = term_positions[i].get(doc_id, "")
+                pos_lists.append([int(p) for p in raw.split(".")] if raw else [])
             if all(pos_lists):
                 span = min_window_span(pos_lists)
                 if span >= 0:
@@ -315,12 +318,26 @@ def search(query: str, ioi: dict[str, int], doc_map: dict[int, str],
         return score
 
     if use_or:
-        all_doc_ids: set[int] = set()
+        # in OR mode, prefer docs matching multiple terms
+        # count term matches per doc to prioritize multi-match docs
+        doc_match_count: dict[int, int] = {}
         for tp in term_postings:
-            all_doc_ids.update(tp.keys())
+            for did in tp:
+                doc_match_count[did] = doc_match_count.get(did, 0) + 1
+        # always include AND matches and bigram matches
+        all_doc_ids: set[int] = set(candidate_docs)
+        all_doc_ids.update(bigram_docs.keys())
+        # include docs matching 2+ terms
+        for did, cnt in doc_match_count.items():
+            if cnt >= 2:
+                all_doc_ids.add(did)
+        # if still too few, include single-match docs from high-IDF terms
+        if len(all_doc_ids) < AND_MIN_RESULTS:
+            for i, tp in enumerate(term_postings):
+                all_doc_ids.update(tp.keys())
         scored = []
         for doc_id in all_doc_ids:
-            sc = score_doc(doc_id)
+            sc = score_doc(doc_id, skip_proximity=(doc_id not in candidate_docs))
             if doc_id in candidate_docs:
                 sc *= AND_BONUS
             scored.append((doc_map.get(doc_id, f"doc_{doc_id}"), sc))
@@ -328,10 +345,14 @@ def search(query: str, ioi: dict[str, int], doc_map: dict[int, str],
         scored = [(doc_map.get(doc_id, f"doc_{doc_id}"), score_doc(doc_id))
                   for doc_id in candidate_docs]
 
-    # filter duplicates
+    # filter duplicates — use heap for top-K instead of full sort
+    TOP_K = 1000
+    if len(scored) > TOP_K:
+        scored = heapq.nlargest(TOP_K, scored, key=lambda x: x[1])
+    else:
+        scored.sort(key=lambda x: -x[1])
     filtered = []
     seen_canonical = set()
-    scored.sort(key=lambda x: -x[1])
     for url, sc in scored:
         if not url_to_did or not duplicates:
             filtered.append((url, sc))

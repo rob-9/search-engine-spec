@@ -4,6 +4,7 @@ flask app with search box and ranked results.
 """
 
 import atexit
+import threading
 import time
 from pathlib import Path
 
@@ -257,6 +258,7 @@ else:
     avgdl = 1.0
 
 atexit.register(index_fh.close)
+search_lock = threading.Lock()
 print(f"Ready. {len(ioi)} terms, {total_docs} docs")
 
 
@@ -274,8 +276,9 @@ def search_page():
         return render_template_string(HTML_TEMPLATE, query="", results=[], num_results=0, elapsed_ms=0)
 
     t_start = time.time()
-    results = search(query, ioi, doc_map, total_docs, index_fh,
-                     doc_lengths, avgdl, duplicates, cache, url_to_did, pagerank)
+    with search_lock:
+        results = search(query, ioi, doc_map, total_docs, index_fh,
+                         doc_lengths, avgdl, duplicates, cache, url_to_did, pagerank)
     elapsed_ms = f"{(time.time() - t_start) * 1000:.1f}"
 
     top_results = results[:20]

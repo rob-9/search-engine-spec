@@ -1,0 +1,38 @@
+# Test Queries — Assignment 3 M3
+# Format: query | category | notes
+#
+# Categories:
+#   GOOD  = returns relevant results quickly
+#   FIXED = previously poor, improved by M3 changes
+#
+# ============================================================
+# GOOD QUERIES (10) — relevant results, fast response
+# ============================================================
+
+machine learning | GOOD | common CS topic, many relevant pages
+cristina lopes | GOOD | faculty name, title/h1 boost helps
+informatics | GOOD | department name, strong tf-idf signal
+software engineering | GOOD | degree program, bigram boost helps
+ACM | GOOD | well-known acronym, appears in many pages
+computer science | GOOD | broad department topic
+artificial intelligence | GOOD | research area, good cross-page coverage
+data structures | GOOD | course topic, bigram helps exact phrase
+python programming | GOOD | popular language, many course pages
+algorithm | GOOD | fundamental CS concept, high recall
+
+# ============================================================
+# FIXED QUERIES (12) — demonstrate M3 improvements
+# ============================================================
+
+master of software engineering | FIXED | was: AND too strict, few results → now: OR fallback finds relevant pages
+undergraduate research opportunities in machine learning | FIXED | was: AND over 7 terms returned 0 → now: OR fallback with AND bonus for partial matches
+ICS | FIXED | was: short acronym biased toward long docs → now: BM25 length normalization fixes ranking
+information retrieval | FIXED | was: no phrase awareness → now: bigram "inform_retriev" boosts exact phrase matches
+dean | FIXED | was: body-only matches ranked high → now: title/h1 tier boost surfaces the actual dean's page
+fellowship | FIXED | was: duplicate clutter from near-identical pages → now: SimHash dedup filters copies
+graduate admission | FIXED | was: long FAQ pages outranked short authoritative pages → now: BM25 normalizes for doc length
+capstone project | FIXED | was: no phrase signal → now: bigram boost for adjacent terms
+Rina Dechter | FIXED | was: only exact AND match → now: anchor text from other pages linking to her helps
+database management | FIXED | was: generic long pages ranked first → now: tiered importance + BM25 puts focused pages on top
+web crawler | FIXED | was: AND returned few results → now: OR fallback finds partial matches across many pages
+uci computer science ranking | FIXED | was: 5-term AND too restrictive → now: OR fallback + AND bonus for best matches

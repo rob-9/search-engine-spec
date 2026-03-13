@@ -5,6 +5,7 @@ reads from developer.zip, builds a disk-based inverted index with:
   - document length tracking for BM25
   - SimHash near-duplicate detection
   - bigram indexing
+  - anchor text indexing
 """
 
 import json
@@ -16,6 +17,7 @@ import warnings
 import zipfile
 from collections import defaultdict
 from pathlib import Path
+from urllib.parse import urljoin, urldefrag
 
 from bs4 import BeautifulSoup, MarkupResemblesLocatorWarning, XMLParsedAsHTMLWarning
 from nltk.stem import PorterStemmer
@@ -108,7 +110,17 @@ def parse_document(html: str):
     for s in stemmed_tokens:
         term_tf[s] += 1
 
-    return dict(term_tf), stem_max_tier, doc_length, stemmed_tokens
+    # extract anchor text for outgoing links
+    anchors = []
+    for a_tag in soup.find_all("a", href=True):
+        href = a_tag["href"]
+        anchor_text = a_tag.get_text(separator=" ", strip=True)
+        if anchor_text:
+            anchor_stems = [cached_stem(t) for t in tokenize(anchor_text)]
+            if anchor_stems:
+                anchors.append((href, anchor_stems))
+
+    return dict(term_tf), stem_max_tier, doc_length, stemmed_tokens, anchors
 
 
 def write_partial_index(partial_index: dict, partial_num: int) -> str:
@@ -223,12 +235,14 @@ def main():
     print(f"Found {total_docs} JSON files")
 
     doc_id_map: dict[int, str] = {}
+    url_to_doc_id: dict[str, int] = {}
     doc_lengths: dict[int, int] = {}
     fingerprints: dict[int, int] = {}
     partial_index: dict[str, list] = defaultdict(list)
     partial_num = 0
     partial_paths: list[str] = []
     doc_id = 0
+    anchor_targets: dict[str, list[str]] = defaultdict(list)
 
     for jf in json_files:
         try:
@@ -241,9 +255,11 @@ def main():
             continue
 
         doc_id_map[doc_id] = url
+        clean_url = urldefrag(url)[0].rstrip("/").lower()
+        url_to_doc_id[clean_url] = doc_id
 
         if content.strip():
-            term_tf, stem_max_tier, doc_length, stemmed_tokens = parse_document(content)
+            term_tf, stem_max_tier, doc_length, stemmed_tokens, anchors = parse_document(content)
             doc_lengths[doc_id] = doc_length
 
             if term_tf:
@@ -260,6 +276,15 @@ def main():
                 bigram_tf[bg] += 1
             for bg, tf in bigram_tf.items():
                 partial_index[bg].append((doc_id, tf, TIER_BODY))
+
+            # collect anchor text for target resolution
+            for href, anchor_stems in anchors:
+                try:
+                    resolved = urljoin(url, href)
+                    resolved = urldefrag(resolved)[0].rstrip("/").lower()
+                    anchor_targets[resolved].extend(anchor_stems)
+                except Exception:
+                    pass
         else:
             doc_lengths[doc_id] = 0
 
@@ -286,6 +311,28 @@ def main():
     zf.close()
     parse_done = time.time()
     print(f"\nParsing complete: {doc_id} docs, {partial_num} partial indexes ({parse_done - start:.1f}s)")
+
+    # anchor text pass: add anchor stems to target doc postings
+    print("Processing anchor text...")
+    anchor_count = 0
+    for target_url, stems in anchor_targets.items():
+        target_did = url_to_doc_id.get(target_url)
+        if target_did is None:
+            continue
+        atf: dict[str, int] = defaultdict(int)
+        for s in stems:
+            atf[s] += 1
+        for stem, tf in atf.items():
+            partial_index[stem].append((target_did, tf, TIER_H1))
+            anchor_count += 1
+    print(f"  Added {anchor_count} anchor text postings")
+
+    # final anchor text batch
+    if partial_index:
+        print(f"  >> Offloading anchor text partial index {partial_num} ({len(partial_index)} terms)")
+        path = write_partial_index(partial_index, partial_num)
+        partial_paths.append(path)
+        partial_num += 1
 
     # merge
     print("Merging partial indexes...")

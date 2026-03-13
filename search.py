@@ -45,6 +45,7 @@ stem_cache: dict[str, str] = {}
 
 
 def cached_stem(token: str) -> str:
+    """stem a token with memoization."""
     s = stem_cache.get(token)
     if s is None:
         s = stemmer.stem(token)
@@ -53,10 +54,12 @@ def cached_stem(token: str) -> str:
 
 
 def tokenize(text: str) -> list[str]:
+    """split text into lowercase alphanumeric tokens."""
     return re.findall(r"[a-zA-Z0-9]+", text.lower())
 
 
 def load_index_of_index() -> dict[str, int]:
+    """load term -> byte offset map for disk-based index seeks."""
     ioi = {}
     with open(INDEX_DIR / "index_of_index.txt", "r", encoding="utf-8") as f:
         for line in f:
@@ -67,6 +70,7 @@ def load_index_of_index() -> dict[str, int]:
 
 
 def load_doc_id_map() -> dict[int, str]:
+    """load doc_id -> url mapping."""
     doc_map = {}
     with open(INDEX_DIR / "doc_id_map.txt", "r", encoding="utf-8") as f:
         for line in f:
@@ -77,6 +81,7 @@ def load_doc_id_map() -> dict[int, str]:
 
 
 def load_doc_lengths() -> dict[int, int]:
+    """load doc_id -> token count for BM25 length normalization."""
     lengths = {}
     path = INDEX_DIR / "doc_lengths.txt"
     if not path.exists():
@@ -90,6 +95,7 @@ def load_doc_lengths() -> dict[int, int]:
 
 
 def load_duplicates() -> dict[int, int]:
+    """load dup_doc_id -> canonical_doc_id map for dedup filtering."""
     dups = {}
     path = INDEX_DIR / "duplicates.txt"
     if not path.exists():
@@ -103,6 +109,7 @@ def load_duplicates() -> dict[int, int]:
 
 
 def load_pagerank() -> dict[int, float]:
+    """load doc_id -> pagerank score."""
     pr = {}
     path = INDEX_DIR / "pagerank.txt"
     if not path.exists():
@@ -116,6 +123,7 @@ def load_pagerank() -> dict[int, float]:
 
 
 def load_total_docs() -> int:
+    """read total document count from metadata."""
     with open(INDEX_DIR / "metadata.txt", "r", encoding="utf-8") as f:
         for line in f:
             if line.startswith("documents:"):
@@ -340,6 +348,7 @@ def search(query: str, ioi: dict[str, int], doc_map: dict[int, str],
 
 
 def main():
+    """interactive search REPL for testing queries from the terminal."""
     print("Loading index metadata...")
     t0 = time.time()
     ioi = load_index_of_index()

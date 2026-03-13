@@ -61,6 +61,7 @@ stem_cache: dict[str, str] = {}
 
 
 def cached_stem(token: str) -> str:
+    """stem a token with memoization to avoid repeated porter stemmer calls."""
     s = stem_cache.get(token)
     if s is None:
         s = stemmer.stem(token)
@@ -69,6 +70,7 @@ def cached_stem(token: str) -> str:
 
 
 def tokenize(text: str) -> list[str]:
+    """split text into lowercase alphanumeric tokens."""
     return re.findall(r"[a-zA-Z0-9]+", text.lower())
 
 
@@ -90,6 +92,7 @@ def compute_simhash(term_tf: dict[str, int]) -> int:
 
 
 def hamming_distance(a: int, b: int) -> int:
+    """count differing bits between two integers."""
     return bin(a ^ b).count("1")
 
 
@@ -172,11 +175,13 @@ def write_partial_index(partial_index: dict, partial_num: int) -> str:
 
 
 def parse_posting_line(line: str):
+    """split an index line into (term, postings_str) at the first pipe."""
     sep = line.index("|")
     return line[:sep], line[sep + 1:]
 
 
 def merge_partial_indexes(partial_paths: list[str]):
+    """k-way merge of sorted partial index files into final index + index-of-index."""
     index_path = INDEX_DIR / "index.txt"
     ioi_path = INDEX_DIR / "index_of_index.txt"
     unique_terms = 0
@@ -263,6 +268,7 @@ def find_duplicates(fingerprints: dict[int, int]) -> dict[int, int]:
 
 
 def main():
+    """build the full inverted index from the corpus zip file."""
     start = time.time()
     INDEX_DIR.mkdir(parents=True, exist_ok=True)
 

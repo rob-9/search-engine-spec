@@ -372,28 +372,45 @@ def search(query: str, ioi: dict[str, int], doc_map: dict[int, str],
     return filtered
 
 
+class SearchEngine:
+    """Loaded search index with a single-method query interface."""
+
+    def __init__(self, index_dir: Path = INDEX_DIR):
+        self.index_dir = index_dir
+        self.ioi = load_index_of_index()
+        self.doc_map = load_doc_id_map()
+        self.total_docs = load_total_docs()
+        self.doc_lengths = load_doc_lengths()
+        self.duplicates = load_duplicates()
+        self.pagerank = load_pagerank()
+        self.url_to_did = {url: did for did, url in self.doc_map.items()}
+        self.avgdl = (
+            sum(self.doc_lengths.values()) / len(self.doc_lengths)
+            if self.doc_lengths else 1.0
+        )
+        self._index_fh = open(index_dir / "index.txt", "rb")
+        self._cache = PostingsCache()
+
+    def query(self, query_str: str) -> list[tuple[str, float]]:
+        """Run a ranked search and return (url, score) pairs."""
+        return search(
+            query_str, self.ioi, self.doc_map, self.total_docs,
+            self._index_fh, self.doc_lengths, self.avgdl,
+            self.duplicates, self._cache, self.url_to_did, self.pagerank,
+        )
+
+    def close(self):
+        """Release the index file handle."""
+        self._index_fh.close()
+
+
 def main():
-    """interactive search REPL for testing queries from the terminal."""
+    """Interactive search REPL for testing queries from the terminal."""
     print("Loading index metadata...")
     t0 = time.time()
-    ioi = load_index_of_index()
-    doc_map = load_doc_id_map()
-    total_docs = load_total_docs()
-    doc_lengths = load_doc_lengths()
-    duplicates = load_duplicates()
-    pagerank = load_pagerank()
-    index_fh = open(INDEX_DIR / "index.txt", "rb")
-    cache = PostingsCache()
-
-    url_to_did = {url: did for did, url in doc_map.items()}
-
-    if doc_lengths:
-        avgdl = sum(doc_lengths.values()) / len(doc_lengths)
-    else:
-        avgdl = 1.0
-
-    t1 = time.time()
-    print(f"Ready. {len(ioi)} terms, {total_docs} docs, {len(duplicates)} dups loaded in {t1 - t0:.2f}s\n")
+    engine = SearchEngine()
+    print(f"Ready. {len(engine.ioi)} terms, {engine.total_docs} docs, "
+          f"{len(engine.duplicates)} dups loaded in {time.time() - t0:.2f}s\n")
 
     while True:
         try:
@@ -409,12 +426,8 @@ def main():
             break
 
         t_start = time.time()
-        results = search(query, ioi, doc_map, total_docs, index_fh,
-                         doc_lengths, avgdl, duplicates, cache,
-                         url_to_did, pagerank)
-        t_end = time.time()
-
-        elapsed_ms = (t_end - t_start) * 1000
+        results = engine.query(query)
+        elapsed_ms = (time.time() - t_start) * 1000
         print(f"  [{len(results)} results in {elapsed_ms:.1f}ms]")
 
         if not results:
@@ -427,7 +440,7 @@ def main():
             print(f"  ... and {len(results) - 5} more")
         print()
 
-    index_fh.close()
+    engine.close()
 
 
 if __name__ == "__main__":

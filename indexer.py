@@ -1,13 +1,24 @@
 """
-inverted index builder — assignment 3 m3
-reads from developer.zip, builds a disk-based inverted index with:
-  - tiered importance scoring (0-3)
-  - document length tracking for BM25
-  - SimHash near-duplicate detection
-  - bigram indexing
-  - anchor text indexing
-  - word position indexing
-  - PageRank computation
+Inverted index builder for the ICS web corpus search engine.
+
+Reads approximately 56,000 HTML pages from developer.zip and constructs a
+disk-based inverted index. The indexer processes each document by parsing its
+HTML, extracting tokens, stemming them with Porter stemmer, and recording term
+frequencies, word positions, and importance tiers derived from HTML tag context
+(title, h1, h2/h3/bold, body text).
+
+The index is built in batches: every 18,000 documents the in-memory partial
+index is flushed to a sorted file on disk, satisfying the requirement to offload
+at least 3 times. After all documents are processed, a k-way heap merge combines
+the sorted partial files into a single final index with an accompanying
+index-of-index for O(1) byte-offset lookups at query time.
+
+Additional signals computed during indexing:
+  - SimHash fingerprints for near-duplicate detection (64-bit, 4-band LSH)
+  - Bigram (2-gram) entries for consecutive token pair matching
+  - Anchor text from <a> tags, attributed to the linked target document
+  - PageRank scores via power iteration over the extracted link graph
+  - Per-document token counts for BM25 length normalization
 """
 
 import hashlib
@@ -29,17 +40,23 @@ from nltk.stem import PorterStemmer
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 warnings.filterwarnings("ignore", category=MarkupResemblesLocatorWarning)
 
-# configuration
+# ── configuration ──────────────────────────────────────────────────────────────
 CORPUS_ZIP = "/Users/robert/Downloads/developer.zip"
 INDEX_DIR = Path("index")
+# Number of documents to process before flushing the in-memory partial index to
+# disk. With ~56k documents this guarantees at least 3 offloads as required.
 BATCH_SIZE = 18_000
 
-# importance tiers
+# ── importance tiers ───────────────────────────────────────────────────────────
+# Words appearing in more prominent HTML tags are assigned a higher tier value.
+# At search time each tier maps to a score multiplier (title=3x, h1=2x, etc.).
 TIER_TITLE = 3
 TIER_H1 = 2
 TIER_EMPHASIS = 1  # h2, h3, b, strong
 TIER_BODY = 0
 
+# Maps HTML tag names to their importance tier. When the parser encounters text
+# inside one of these tags, every stemmed token gets at least this tier value.
 TAG_TIERS = {
     "title": TIER_TITLE,
     "h1": TIER_H1,
@@ -49,13 +66,13 @@ TAG_TIERS = {
     "strong": TIER_EMPHASIS,
 }
 
-# simhash constants
-SIMHASH_BITS = 64
-HAMMING_THRESHOLD = 3
+# ── SimHash near-duplicate detection ──────────────────────────────────────────
+SIMHASH_BITS = 64          # fingerprint length in bits
+HAMMING_THRESHOLD = 3      # max bit differences to consider two pages near-duplicates
 
-# pagerank constants
-PR_DAMPING = 0.85
-PR_ITERATIONS = 25
+# ── PageRank ──────────────────────────────────────────────────────────────────
+PR_DAMPING = 0.85          # probability of following a link vs. teleporting randomly
+PR_ITERATIONS = 25         # number of power-iteration rounds (sufficient for convergence)
 
 # globals
 stemmer = PorterStemmer()
@@ -63,7 +80,12 @@ stem_cache: dict[str, str] = {}
 
 
 def cached_stem(token: str) -> str:
-    """stem a token with memoization to avoid repeated porter stemmer calls."""
+    """Return the Porter-stemmed form of a token, using a dictionary cache.
+
+    The Porter stemmer is computationally expensive relative to a dict lookup.
+    Since the same surface-form words appear across thousands of documents,
+    caching avoids millions of redundant stemmer invocations during indexing.
+    """
     s = stem_cache.get(token)
     if s is None:
         s = stemmer.stem(token)
@@ -72,20 +94,44 @@ def cached_stem(token: str) -> str:
 
 
 def tokenize(text: str) -> list[str]:
-    """split text into lowercase alphanumeric tokens."""
+    """Split text into lowercase alphanumeric tokens.
+
+    Uses the regex pattern [a-zA-Z0-9]+ to capture every contiguous sequence
+    of letters and digits. Punctuation, whitespace, and special characters act
+    as delimiters and are discarded. The result is lowercased so that matching
+    is case-insensitive. No stop-word removal is performed (per the spec).
+    """
     return re.findall(r"[a-zA-Z0-9]+", text.lower())
 
 
+def canonical_url(url: str) -> str:
+    """Normalize a URL by removing fragment and trailing slash."""
+    return urldefrag(url)[0].rstrip("/").lower()
+
+
 def compute_simhash(term_tf: dict[str, int]) -> int:
-    """compute 64-bit SimHash fingerprint from term frequencies."""
+    """Compute a 64-bit SimHash fingerprint from a document's term frequencies.
+
+    SimHash is a locality-sensitive hash: documents with similar content produce
+    fingerprints that differ in only a few bits. The algorithm works by treating
+    each bit position as a weighted vote. For every term, its MD5 hash determines
+    which way each bit votes (+tf or -tf). After all terms have voted, each bit
+    is set to 1 if its accumulated weight is positive, 0 otherwise.
+
+    The result is a single 64-bit integer that summarizes the document's content.
+    Two documents can then be compared by counting the differing bits (Hamming
+    distance) — a distance of 3 or fewer bits indicates near-duplicate content.
+    """
     v = [0] * SIMHASH_BITS
     for term, tf in term_tf.items():
+        # Hash the term with MD5 and take the first 8 bytes as a 64-bit integer
         h = struct.unpack("<Q", hashlib.md5(term.encode()).digest()[:8])[0]
         for i in range(SIMHASH_BITS):
             if h & (1 << i):
                 v[i] += tf
             else:
                 v[i] -= tf
+    # Convert the vote tallies into a binary fingerprint
     fingerprint = 0
     for i in range(SIMHASH_BITS):
         if v[i] > 0:
@@ -94,21 +140,41 @@ def compute_simhash(term_tf: dict[str, int]) -> int:
 
 
 def hamming_distance(a: int, b: int) -> int:
-    """count differing bits between two integers."""
+    """Count the number of bit positions where two integers differ.
+
+    XOR produces a 1 at every position where the inputs differ, then we count
+    the 1-bits. Used to measure similarity between SimHash fingerprints.
+    """
     return bin(a ^ b).count("1")
 
 
 def compute_pagerank(outlinks: dict[int, set[int]], total_docs: int) -> list[float]:
-    """compute pagerank scores using power iteration."""
+    """Compute PageRank scores for all documents using power iteration.
+
+    PageRank models a "random surfer" who follows links with probability d
+    (the damping factor, 0.85) and jumps to a random page with probability
+    1-d. Pages linked to by many others — especially by authoritative pages —
+    accumulate higher scores.
+
+    Dangling nodes (pages with no outlinks) are handled by redistributing
+    their rank equally across all pages, preventing rank from leaking out of
+    the graph.
+
+    After 25 iterations the scores have converged sufficiently for ranking.
+    Returns a list indexed by doc_id.
+    """
     pr = [1.0 / total_docs] * total_docs
     for _ in range(PR_ITERATIONS):
+        # Dangling nodes contribute their rank uniformly to all pages
         dangling_sum = sum(
             pr[i] for i in range(total_docs)
             if i not in outlinks or not outlinks[i]
         )
         dangling_contrib = PR_DAMPING * dangling_sum / total_docs
+        # Every page gets a baseline from the random teleport + dangling redistribution
         base = (1 - PR_DAMPING) / total_docs + dangling_contrib
         new_pr = [base] * total_docs
+        # Each page distributes its rank equally among the pages it links to
         for src, targets in outlinks.items():
             if not targets:
                 continue
@@ -121,10 +187,24 @@ def compute_pagerank(outlinks: dict[int, set[int]], total_docs: int) -> list[flo
 
 
 def parse_document(html: str):
-    """returns (term_tf, stem_max_tier, doc_length, stemmed_tokens)."""
+    """Parse an HTML document and extract all indexing signals.
+
+    Returns a tuple of:
+      - term_tf: dict mapping each stemmed term to its frequency in the document
+      - stem_max_tier: dict mapping each stem to the highest importance tier it
+        was found in (e.g., a word in both title and body gets the title tier)
+      - doc_length: total token count, used later for BM25 length normalization
+      - stemmed_tokens: ordered list of all stems, used to extract bigrams
+      - term_positions: dict mapping each stem to its list of word positions,
+        used later for proximity scoring at query time
+      - anchors: list of (href, [anchor_stems]) for outgoing links, used to
+        index anchor text under the target document
+    """
     soup = BeautifulSoup(html, "lxml")
 
-    # tiered importance: track max tier per stem
+    # First pass: scan important HTML tags (title, h1, h2, h3, b, strong) and
+    # record the highest importance tier for each stemmed token. If "algorithm"
+    # appears in both the title and body, it gets tier 3 (title).
     stem_max_tier: dict[str, int] = {}
     for tag_name, tier in TAG_TIERS.items():
         for tag in soup.find_all(tag_name):
@@ -134,7 +214,9 @@ def parse_document(html: str):
                 if tier > stem_max_tier.get(s, -1):
                     stem_max_tier[s] = tier
 
-    # full text: tf, positions, doc length
+    # Second pass: extract the full visible text and compute term frequencies
+    # and word positions. The position of each token (0-indexed) is recorded so
+    # that proximity scoring can determine how close query terms appear.
     full_text = soup.get_text(separator=" ", strip=True)
     tokens = tokenize(full_text)
     doc_length = len(tokens)
@@ -145,7 +227,9 @@ def parse_document(html: str):
         term_tf[s] += 1
         term_positions[s].append(pos)
 
-    # extract anchor text for outgoing links
+    # Third pass: extract anchor text from outgoing <a> links. The visible text
+    # of each link describes the target page from an external perspective —
+    # these stems will later be indexed under the target document.
     anchors = []
     for a_tag in soup.find_all("a", href=True):
         href = a_tag["href"]
@@ -159,7 +243,13 @@ def parse_document(html: str):
 
 
 def write_partial_index(partial_index: dict, partial_num: int) -> str:
-    """write sorted partial index. posting format: doc:tf:tier[:positions]."""
+    """Flush the in-memory partial index to a sorted file on disk.
+
+    Each line has the format: term|doc:tf:tier:pos1.pos2.pos3,...
+    Terms are written in sorted (alphabetical) order so that the k-way merge
+    can efficiently combine multiple partial files using a min-heap. Positions
+    are dot-separated integers representing word offsets within the document.
+    """
     path = INDEX_DIR / f"partial_{partial_num}.txt"
     with open(path, "w", encoding="utf-8") as f:
         for term in sorted(partial_index.keys()):
@@ -177,13 +267,27 @@ def write_partial_index(partial_index: dict, partial_num: int) -> str:
 
 
 def parse_posting_line(line: str):
-    """split an index line into (term, postings_str) at the first pipe."""
+    """Split an index line into (term, postings_str) at the first pipe delimiter."""
     sep = line.index("|")
     return line[:sep], line[sep + 1:]
 
 
 def merge_partial_indexes(partial_paths: list[str]):
-    """k-way merge of sorted partial index files into final index + index-of-index."""
+    """K-way merge of all sorted partial index files into the final index.
+
+    Opens all partial files simultaneously and uses a min-heap to merge them
+    in alphabetical order. When the same term appears in multiple partial files
+    (because it occurred in documents across different batches), their posting
+    lists are concatenated.
+
+    Produces two output files:
+      - index.txt: the complete inverted index, one line per term
+      - index_of_index.txt: maps each term to its byte offset in index.txt,
+        enabling O(1) lookups at query time via file.seek()
+
+    This is the standard external merge sort approach for building indexes
+    that are too large to fit in memory at once.
+    """
     index_path = INDEX_DIR / "index.txt"
     ioi_path = INDEX_DIR / "index_of_index.txt"
     unique_terms = 0
@@ -239,8 +343,10 @@ def merge_partial_indexes(partial_paths: list[str]):
 
 
 def find_duplicates(fingerprints: dict[int, int]) -> dict[int, int]:
-    """find near-duplicate documents using multi-band SimHash.
-    returns dict mapping duplicate doc_id -> canonical doc_id."""
+    """Find near-duplicate documents using multi-band SimHash.
+
+    Returns dict mapping duplicate doc_id -> canonical doc_id.
+    """
     duplicates = {}
     items = sorted(fingerprints.items())
 
@@ -269,8 +375,21 @@ def find_duplicates(fingerprints: dict[int, int]) -> dict[int, int]:
     return duplicates
 
 
+def resolve_link_graph(
+    raw_links: list[tuple[str, str]], url_to_doc_id: dict[str, int],
+) -> dict[int, set[int]]:
+    """Convert (source_url, target_url) pairs into a doc_id adjacency map."""
+    outlinks: dict[int, set[int]] = {}
+    for src_url, tgt_url in raw_links:
+        src_did = url_to_doc_id.get(src_url)
+        tgt_did = url_to_doc_id.get(tgt_url)
+        if src_did is not None and tgt_did is not None and src_did != tgt_did:
+            outlinks.setdefault(src_did, set()).add(tgt_did)
+    return outlinks
+
+
 def main():
-    """build the full inverted index from the corpus zip file."""
+    """Build the full inverted index from the corpus zip file."""
     start = time.time()
     INDEX_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -302,7 +421,7 @@ def main():
             continue
 
         doc_id_map[doc_id] = url
-        clean_url = urldefrag(url)[0].rstrip("/").lower()
+        clean_url = canonical_url(url)
         url_to_doc_id[clean_url] = doc_id
 
         if content.strip():
@@ -329,7 +448,7 @@ def main():
             for href, anchor_stems in anchors:
                 try:
                     resolved = urljoin(url, href)
-                    resolved = urldefrag(resolved)[0].rstrip("/").lower()
+                    resolved = canonical_url(resolved)
                     anchor_targets[resolved].extend(anchor_stems)
                     raw_links.append((clean_url, resolved))
                 except Exception:
@@ -363,6 +482,7 @@ def main():
 
     # anchor text pass: add anchor stems to target doc postings
     print("Processing anchor text...")
+    anchor_index: dict[str, list] = defaultdict(list)
     anchor_count = 0
     for target_url, stems in anchor_targets.items():
         target_did = url_to_doc_id.get(target_url)
@@ -372,14 +492,13 @@ def main():
         for s in stems:
             atf[s] += 1
         for stem, tf in atf.items():
-            partial_index[stem].append((target_did, tf, TIER_H1))
+            anchor_index[stem].append((target_did, tf, TIER_H1))
             anchor_count += 1
     print(f"  Added {anchor_count} anchor text postings")
 
-    # final anchor text batch
-    if partial_index:
-        print(f"  >> Offloading anchor text partial index {partial_num} ({len(partial_index)} terms)")
-        path = write_partial_index(partial_index, partial_num)
+    if anchor_index:
+        print(f"  >> Offloading anchor text partial index {partial_num} ({len(anchor_index)} terms)")
+        path = write_partial_index(anchor_index, partial_num)
         partial_paths.append(path)
         partial_num += 1
 
@@ -409,14 +528,7 @@ def main():
 
     # resolve link graph post-loop (so forward links are captured)
     print("Resolving link graph...")
-    outlinks: dict[int, set[int]] = {}
-    for src_url, tgt_url in raw_links:
-        src_did = url_to_doc_id.get(src_url)
-        tgt_did = url_to_doc_id.get(tgt_url)
-        if src_did is not None and tgt_did is not None and src_did != tgt_did:
-            if src_did not in outlinks:
-                outlinks[src_did] = set()
-            outlinks[src_did].add(tgt_did)
+    outlinks = resolve_link_graph(raw_links, url_to_doc_id)
     del raw_links
 
     # pagerank
